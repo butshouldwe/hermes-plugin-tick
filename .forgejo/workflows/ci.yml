@@ -1,0 +1,83 @@
+name: ci
+
+# Maintainer CI (Forgejo). The job display name is `verify`, so the status
+# context is `ci / verify (pull_request)`, which branch protection requires.
+# Runner image: node:26-bookworm. Its python3 has no pip (PEP 668), so pytest
+# comes from a throwaway venv, else from apt. GitHub CI: .github/workflows/ci.yml.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: docker
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          python3 --version
+          if python3 -m venv /tmp/venv 2>/dev/null && /tmp/venv/bin/pip install --quiet 'pytest==8.4.2' 'pyyaml==6.0.3' 'fastapi==0.133.1' 'starlette==1.3.1' 'httpx==0.28.1'; then
+            echo "/tmp/venv/bin" >> "$GITHUB_PATH"
+          else
+            apt-get update -qq && apt-get install -y -qq python3-pytest python3-yaml python3-fastapi python3-httpx >/dev/null
+          fi
+
+      - name: Syntax
+        run: |
+          python3 -m py_compile __init__.py dashboard/plugin_api.py
+          node --check desktop/plugin.js
+
+      - name: Tests
+        run: |
+          set -euo pipefail
+          python3 -m pytest -q tests/ | tee /tmp/pytest.out
+          grep -Eq '[1-9][0-9]* passed' /tmp/pytest.out
+          if grep -Eq ' skipped' /tmp/pytest.out; then echo "skipped tests in CI: dependency missing"; exit 1; fi
+
+      - name: Desktop tests
+        run: node --test 'tests/js/*.test.mjs'
+
+  validate:
+    # `hermes plugins validate` is the Hermes plugin-catalog gate. It runs in
+    # the official Hermes image pinned by digest (stable, v0.21.6, 818c13be),
+    # because Hermes does not ship as a pip-installable package.
+    # Stricter than the catalog: any warning fails, so a declared-but-missing
+    # tool or hook cannot pass.
+    name: validate
+    runs-on: docker
+    timeout-minutes: 15
+    container:
+      image: nousresearch/hermes-agent@sha256:9774f4f39a9bb8c2f68ce728ed5e99ddbad282163be56764afacf88ed952b784
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: hermes plugins validate
+        env:
+          HERMES_HOME: /tmp/hermes-home
+        run: |
+          set -euo pipefail
+          hermes --version
+          hermes plugins validate . | tee /tmp/validate.txt
+          hermes plugins validate --json . > /tmp/validate.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("/tmp/validate.json"))
+          failed = [c["name"] for c in d["checks"] if not c["ok"]]
+          if not d["ok"] or failed or d["warnings"]:
+              print("validate failed:", failed, d["warnings"])
+              sys.exit(1)
+          print("validate ok, no warnings")
+          PY

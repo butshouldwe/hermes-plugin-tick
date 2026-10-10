@@ -1,0 +1,10 @@
+{
+  "name": "tick",
+  "label": "tick",
+  "description": "Backend for the tick desktop companion (device time zone). No page.",
+  "icon": "Clock",
+  "version": "0.2.1",
+  "tab": { "path": "/tick", "hidden": true },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

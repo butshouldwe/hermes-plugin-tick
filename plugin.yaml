@@ -1,0 +1,86 @@
+name: tick
+version: "0.2.1"
+manifest_version: 2
+api_version: 1
+license: MIT
+author: butshouldwe
+description: >-
+  Keeps agents grounded in time. Each turn adds the local time, UTC offset,
+  gap since the last message and, optionally, the model's training cutoff.
+  The zone is the user's, not the server's: a desktop companion reports the
+  device zone, and /tz sets it on any surface.
+  After a long gap or a compaction it lists what the agent observed earlier,
+  its open ledger items and due checks, so it re-checks stale facts before
+  acting. Adds only to the current user message, so the prompt cache stays
+  valid.
+provides_tools:
+  - tick
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call
+  - pre_auxiliary_call
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: Master switch.
+  label:
+    type: str
+    default: tick
+    description: Tag on injected lines, shown as [label].
+  timezone:
+    type: str
+    default: ""
+    description: IANA zone such as America/New_York. Empty uses the Hermes timezone setting, then the host zone.
+  clock:
+    type: bool
+    default: true
+    description: Add the time line on every turn.
+  stale_after_minutes:
+    type: int
+    default: 60
+    description: Gap after which earlier observations count as stale.
+  recheck_hint:
+    type: str
+    default: "Earlier observations of mutable state (PRs, CI, deploys, external systems) may be stale. Re-check them before acting on them."
+    description: What to re-check after a stale gap. Set per profile.
+  cutoffs:
+    type: dict
+    default: {}
+    description: Model-name substring to training-cutoff text. Longest match wins.
+  ledger:
+    type: bool
+    default: true
+    description: Record observations and enable the tick tool.
+  observe:
+    type: list
+    default: ["terminal", "web_*", "browser_*", "mcp_*"]
+    description: Tool-name glob patterns recorded as observations.
+  ignore:
+    type: list
+    default: []
+    description: Tool-name glob patterns never recorded.
+  max_observations:
+    type: int
+    default: 40
+    description: Observations kept per session.
+  max_items:
+    type: int
+    default: 60
+    description: Ledger items kept per session; open items are kept first.
+  reconcile_lines:
+    type: int
+    default: 8
+    description: Maximum lines per reconcile section.
+  session_ttl_days:
+    type: int
+    default: 30
+    description: Drop records for sessions idle longer than this.
+  client_timezone:
+    type: bool
+    default: true
+    description: Use the user's device zone (desktop companion) or /tz override before the home zone.
+  device_max_age_hours:
+    type: int
+    default: 72
+    description: Ignore a device zone report older than this.
