@@ -267,7 +267,8 @@ def test_stale_threshold_is_configurable(env):
 
 
 def test_observations_listed_after_stale_gap(env):
-    ctx, clock = env()
+    # observation_details opts into argument text (#6); default is metadata only.
+    ctx, clock = env({"observation_details": True})
     turn(ctx)
     tool(ctx, "terminal", {"command": "gh pr view 19 --repo acme/app"})
     clock.t += 3 * HOUR
@@ -277,7 +278,7 @@ def test_observations_listed_after_stale_gap(env):
 
 
 def test_observation_patterns_are_configurable(env):
-    ctx, clock = env({"observe": ["browser_*"]})
+    ctx, clock = env({"observe": ["browser_*"], "observation_details": True})
     turn(ctx)
     tool(ctx, "terminal", {"command": "ls"})
     tool(ctx, "browser_exec", {"code": "# Open game realm page\nnew_tab(x)"})
@@ -288,15 +289,17 @@ def test_observation_patterns_are_configurable(env):
 
 
 def test_observation_records_failure_status(env):
-    ctx, clock = env()
+    ctx, clock = env({"observation_details": True})
     turn(ctx)
     tool(ctx, "terminal", {"command": "make deploy"}, status="error")
     clock.t += 3 * HOUR
-    assert "make deploy -> error" in turn(ctx)
+    text = turn(ctx)
+    # recorded text is JSON-quoted, and the status renders quoted too
+    assert "make deploy" in text and "error" in text
 
 
 def test_repeat_observation_keeps_only_latest(env):
-    ctx, clock = env()
+    ctx, clock = env({"observation_details": True})
     turn(ctx)
     tool(ctx, "terminal", {"command": "git status"})
     clock.t += 30 * MIN
@@ -308,7 +311,8 @@ def test_repeat_observation_keeps_only_latest(env):
 
 
 def test_observations_are_capped(env):
-    ctx, clock = env({"max_observations": 3, "reconcile_lines": 10})
+    ctx, clock = env({"max_observations": 3, "reconcile_lines": 10,
+                      "observation_details": True})
     turn(ctx)
     for i in range(6):
         tool(ctx, "terminal", {"command": f"cmd{i}"})
@@ -485,7 +489,7 @@ class RacyState(FakeState):
 def test_concurrent_observations_and_adds_all_survive(env):
     import threading
 
-    ctx, _ = env()
+    ctx, _ = env({"observation_details": True})
     ctx.state = RacyState(4)
     tick.register(ctx)  # rebind to the racy state
     jobs = [
@@ -506,7 +510,7 @@ def test_concurrent_observations_and_adds_all_survive(env):
 
 
 def test_inheritance_keeps_child_entries_written_before_first_turn(env):
-    ctx, clock = env()
+    ctx, clock = env({"observation_details": True})
     turn(ctx, sid="old")
     call_tool(ctx, sid="old", action="add", kind="open", text="parent item")
     ctx.hooks["pre_auxiliary_call"](aux_task="compression", session_id="old")

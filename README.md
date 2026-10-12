@@ -38,6 +38,38 @@ Design rules:
 - When compaction gives the session a new id, the ledger carries forward from
   the parent session.
 - Every hook fails open. A tick error never blocks a turn.
+- Due hints appear on the next turn. tick does not wake an idle session or
+  schedule anything; use a real scheduler for that.
+- Collection costs no additional LLM call, but the injected context and the
+  registered tool schema do consume tokens on every turn.
+
+## What is stored, and where
+
+Stored in the profile's plugin state directory
+(`plugin-data/agent-plugin-tick-*/state.json`), keyed by session:
+
+| What | Default contents |
+| --- | --- |
+| Clock | Last message time and last touched time per session |
+| Observations | Tool name, a normalized `ok`/`error` status, and the time |
+| Ledger items | Text the agent wrote through the `tick` tool |
+
+**Argument values are not recorded by default.** With
+`observation_details: true`, tick also stores up to 160 characters of one
+argument value (`command`, `url`, `query`, `code`, `path`, `name` or
+`question`). Those are redacted for common secret shapes, but redaction is
+best effort and cannot recognise every secret.
+
+Retention: records for sessions idle longer than `session_ttl_days` (30) are
+dropped, and each session keeps at most `max_observations` (40) and
+`max_items` (60) entries. Disabling the plugin stops new recording but does
+**not** delete what is already stored; remove the profile's plugin state
+directory to purge it.
+
+Reconcile output is untrusted input. Recorded text is JSON-quoted and labelled
+as untrusted so it cannot forge prompt structure, but it is still sent to
+whichever model provider serves the next turn, like any other context. Do not
+treat tick as a place for secrets.
 
 ## Install
 
@@ -62,6 +94,7 @@ Settings live under `plugins.entries.tick.settings` in the profile's
 | `ledger` | `true` | Record observations and register the `tick` tool |
 | `observe` | `terminal`, `web_*`, `browser_*`, `mcp_*` | Tool-name globs recorded as observations |
 | `ignore` | `[]` | Tool-name globs never recorded |
+| `observation_details` | `false` | Also record a short summary of tool arguments. See "What is stored" below |
 | `max_observations` | `40` | Observations kept per session |
 | `max_items` | `60` | Ledger items kept per session. Open items are kept first |
 | `reconcile_lines` | `8` | Maximum lines per reconcile section |
