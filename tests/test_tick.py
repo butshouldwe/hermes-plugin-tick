@@ -569,3 +569,74 @@ def test_item_ids_are_unique_across_sessions(env):
     a = call_tool(ctx, sid="a", action="add", kind="open", text="x")["id"]
     b = call_tool(ctx, sid="b", action="add", kind="open", text="y")["id"]
     assert a != b
+
+
+# housekeeping ----------------------------------------------------------------------
+
+
+class FileState:
+    """File-backed like the real ctx.state: every get() parses the whole file."""
+
+    def __init__(self, path):
+        self.path = path
+        self.gets = 0
+        path.write_text("{}")
+
+    def _all(self):
+        return json.loads(self.path.read_text())
+
+    def get(self, key, default=None):
+        self.gets += 1
+        return self._all().get(key, default)
+
+    def set(self, key, value):
+        data = self._all()
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+        self.path.write_text(json.dumps(data))
+
+
+def _gc_env(env, tmp_path, fresh=200, expired=3):
+    ctx, clock = env(now=T0)
+    st = FileState(tmp_path / "state.json")
+    old = T0 - 31 * 86400
+    data = {f"s:fresh{i}": {"touched": T0 - HOUR} for i in range(fresh)}
+    data.update({f"s:old{i}": {"touched": old} for i in range(expired)})
+    data["cfg:other"] = {"touched": old}  # not a session record: never collected
+    st.path.write_text(json.dumps(data))
+    ctx.state = st
+    return ctx, st
+
+
+def test_gc_drops_only_expired_session_records(env, tmp_path):
+    ctx, st = _gc_env(env, tmp_path)
+    turn(ctx, sid="s:trigger")
+    left = st._all()
+    assert not [k for k in left if k.startswith("s:old")]
+    assert sum(k.startswith("s:fresh") for k in left) == 200
+    assert "cfg:other" in left
+
+
+def test_gc_reads_the_store_once_not_once_per_key(env, tmp_path):
+    # Before 0.2.3 gc called state.get() for every key, and each get re-parses the
+    # file: on a store with thousands of sessions that was minutes of CPU under
+    # the ledger lock, long enough to stall every hook in the process.
+    ctx, st = _gc_env(env, tmp_path, fresh=200, expired=3)
+    turn(ctx, sid="s:trigger")
+    assert st.gets <= 3 + 5  # the expired candidates, plus the turn's own reads
+
+
+def test_gc_keeps_a_candidate_touched_after_the_snapshot(env, tmp_path):
+    ctx, st = _gc_env(env, tmp_path, fresh=0, expired=1)
+    real_get = st.get
+
+    def get(key, default=None):
+        if key == "s:old0":  # a turn touched it between the snapshot and the recheck
+            st.path.write_text(json.dumps({**st._all(), "s:old0": {"touched": T0}}))
+        return real_get(key, default)
+
+    st.get = get
+    turn(ctx, sid="s:trigger")
+    assert "s:old0" in st._all()

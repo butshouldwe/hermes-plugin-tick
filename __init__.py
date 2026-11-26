@@ -831,12 +831,19 @@ class Tick:
             path = getattr(state, "path", None)
             if path is None:
                 return
+            # One parse of the store, not one per key: state.get() re-reads the whole
+            # file, and this runs under the ledger lock inside pre_llm_call, so a
+            # per-key read is O(keys x file size) while every hook in the profile waits.
             with open(path, encoding="utf-8") as fh:
-                keys = list(json.load(fh))
+                snapshot = json.load(fh)
             cutoff = _now() - self.cfg.session_ttl_days * 86400
-            for k in keys:
-                rec = state.get(k) if k.startswith(("s:", "h:")) else None
-                if isinstance(rec, dict) and rec.get("touched", _now()) < cutoff:
+            for k, rec in snapshot.items():
+                if not k.startswith(("s:", "h:")) or not isinstance(rec, dict):
+                    continue
+                if rec.get("touched", _now()) >= cutoff:
+                    continue
+                cur = state.get(k)  # re-read only candidates: a turn may have touched it
+                if isinstance(cur, dict) and cur.get("touched", _now()) < cutoff:
                     state.set(k, None)
         except Exception as exc:
             logger.debug("tick gc skipped: %s", exc)
