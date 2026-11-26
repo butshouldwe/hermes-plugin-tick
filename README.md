@@ -33,8 +33,9 @@ Design rules:
 
 - Context goes only into the current user message (`pre_llm_call`). The system
   prompt and past history do not change, so the prompt cache stays valid.
-- State is per session in the plugin's profile-scoped `ctx.state`. The gap is
-  correct after a restart.
+- State is per session, one small file each in the plugin's profile-scoped
+  data directory. The gap is correct after a restart. A hook that finds its
+  session locked for 5 seconds gives up and fails open; it never queues.
 - When compaction gives the session a new id, the ledger carries forward from
   the parent session.
 - Every hook fails open. A tick error never blocks a turn.
@@ -46,7 +47,13 @@ Design rules:
 ## What is stored, and where
 
 Stored in the profile's plugin state directory
-(`plugin-data/agent-plugin-tick-*/state.json`), keyed by session:
+(`plugin-data/agent-plugin-tick-*/`): one file per session under `sessions/`,
+the item-id counter in `ids.json`, and the client zone keys in `state.json`:
+
+Item ids are unique across the profile, and `ids.json` is the only record of
+ids that gc or `max_items` already removed. If it is missing, malformed or
+unreadable, `tick add` refuses rather than risk reusing an id. To recover, write
+`{"next": N}` with N above every id the agent has seen.
 
 | What | Default contents |
 | --- | --- |
@@ -65,6 +72,15 @@ dropped, and each session keeps at most `max_observations` (40) and
 `max_items` (60) entries. Disabling the plugin stops new recording but does
 **not** delete what is already stored; remove the profile's plugin state
 directory to purge it.
+
+Upgrading from 0.2.x copies each live session record out of `state.json` into
+`sessions/` once, on the first start. `state.json` keeps its old copies,
+because the host state API has no delete and clearing each key would rewrite
+the whole file once per key. tick no longer reads them, and
+`session_ttl_days` does not expire them. To purge them, stop the gateway and
+remove the `s:` and `h:` keys from `state.json`. If a record fails to copy,
+the next start retries it, and until then that session's first hook reads its
+old record from `state.json`.
 
 Reconcile output is untrusted input. Recorded text is JSON-quoted and labelled
 as untrusted so it cannot forge prompt structure, but it is still sent to

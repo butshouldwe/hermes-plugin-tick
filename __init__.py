@@ -19,6 +19,8 @@ import hashlib
 import json
 import logging
 import math
+import os
+import pathlib
 import re
 import threading
 import time
@@ -210,47 +212,152 @@ def _empty() -> Dict[str, Any]:
 
 _THREAD_LOCKS: Dict[str, threading.Lock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
-_ID_LOCK = threading.Lock()  # always taken inside a session lock, never the reverse
 ID_KEY = "ids:next"
+SEEDED_KEY = "ids:seeded"  # fallback store only: its counter has been written once
+SEED_MARK = "ids.seeded"  # file store: ids.json has been written once; never removed by tick
+# A hook gives up on a busy lock after this long and fails open, well inside the
+# host's 30 s hook limit. An unbounded wait once queued every hook in a profile.
+LOCK_WAIT_S = 5.0
+_STRIPES = 64  # lock files per profile; two sessions share one only by hash collision
+MIGRATED = ".migrated-0.3"
+_MAX_ANCESTORS = 16  # ledgers one turn may read while catching up on inheritance
+
+
+def _thread_lock(name: str) -> threading.Lock:
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(name, threading.Lock())
+
+
+@contextlib.contextmanager
+def _bounded(name: str, lock_file: Optional[pathlib.Path], wait: Optional[float] = None):
+    """Thread lock ``name`` plus, when given, an ``fcntl`` lock on ``lock_file``.
+
+    Both waits end after ``wait`` seconds with ``TimeoutError``, so a slow holder
+    makes callers fail open instead of queueing behind it.
+    """
+    wait = LOCK_WAIT_S if wait is None else wait
+    deadline = time.monotonic() + wait
+    lock = _thread_lock(name)
+    if not (lock.acquire(timeout=wait) if wait > 0 else lock.acquire(blocking=False)):
+        raise TimeoutError(f"tick: lock {name!r} busy for {wait:g}s")
+    fh = None
+    try:
+        fcntl = None
+        if lock_file is not None:
+            try:
+                import fcntl  # noqa: F811
+            except ImportError:  # Windows: the thread lock only
+                fcntl = None
+        if fcntl is not None and lock_file is not None:
+            lock_file.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(lock_file, "a+")
+            while True:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"tick: {lock_file.name} busy for {wait:g}s")
+                    time.sleep(0.005)
+        yield
+    finally:
+        if fh is not None:
+            fh.close()  # closing releases the flock
+        lock.release()
+
+
+def _write_json(path: pathlib.Path, obj: Any) -> None:
+    """Atomic replace, mode 0600. Same JSON dialect as the host store (NaN allowed),
+    so every record 0.2.x stored can be written here."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+class SessionFiles:
+    """One small JSON file per session under ``<data_dir>/sessions``.
+
+    ``ctx.state`` keeps every key in one file and rewrites all of it on each set.
+    With thousands of sessions that made every hook parse and rewrite megabytes
+    under one profile-wide lock. Here a hook reads and writes only its own file,
+    under one of ``_STRIPES`` lock files.
+    """
+
+    def __init__(self, root: pathlib.Path):
+        self.root = root
+        self.dir = root / "sessions"
+
+    @staticmethod
+    def _digest(key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:40]
+
+    def path(self, key: str) -> pathlib.Path:
+        return self.dir / f"{self._digest(key)}.json"
+
+    def lock_file(self, key: str) -> pathlib.Path:
+        return self.root / "locks" / f"{int(self._digest(key)[:8], 16) % _STRIPES:02d}.lock"
+
+    @staticmethod
+    def read(path: Any) -> Optional[Dict[str, Any]]:
+        """The file's ``{"key", "record"}`` document, or None only if it is absent.
+
+        An unreadable or malformed file raises, so the hook fails open and never
+        saves an empty ledger over it.
+        """
+        try:
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except FileNotFoundError:
+            return None
+        if isinstance(doc, dict) and isinstance(doc.get("key"), str) and isinstance(doc.get("record"), dict):
+            return doc
+        raise ValueError(f"tick: malformed session file {pathlib.Path(path).name}")
+
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        doc = self.read(self.path(key))
+        return doc["record"] if doc else None
+
+    def set(self, key: str, record: Dict[str, Any]) -> None:
+        _write_json(self.path(key), {"key": key, "record": record})
+
+    def delete(self, key: str) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.path(key))
 
 
 class Ledger:
-    """Per-session record in ``ctx.state`` (profile-scoped, survives restarts).
+    """Per-session record, profile-scoped, surviving restarts.
 
-    ``ctx.state`` makes each get and set atomic, but not a load-modify-save
-    sequence. ``update`` serializes that sequence per session: a thread lock
-    for parallel hooks and tool calls in one process, plus an ``fcntl`` lock
-    file in the plugin data dir for other processes on the same profile.
+    With a host ``ctx.state`` that has a ``data_dir`` (every real host), records
+    live in ``SessionFiles`` and ``ctx.state`` keeps only the small client-zone
+    keys. A state without ``data_dir`` keeps records in ``ctx.state`` itself.
+    ``update`` serializes load-modify-save per session: a thread lock for hooks
+    in one process, plus a striped ``fcntl`` lock file for other processes on
+    the same profile. Every wait is bounded by ``LOCK_WAIT_S``.
     """
 
     def __init__(self, ctx: Any, cfg: Settings):
         self.ctx = ctx
         self.cfg = cfg
+        self._migrated = False
+
+    @property
+    def files(self) -> Optional[SessionFiles]:
+        data_dir = getattr(self.ctx.state, "data_dir", None)
+        return SessionFiles(pathlib.Path(data_dir)) if data_dir is not None else None
 
     @contextlib.contextmanager
     def _locked(self, key: str):
-        with _THREAD_LOCKS_GUARD:
-            lock = _THREAD_LOCKS.setdefault(key, threading.Lock())
-        with lock:
-            fh = None
-            try:
-                import fcntl
-
-                data_dir = getattr(self.ctx.state, "data_dir", None)
-                if data_dir is not None:
-                    data_dir.mkdir(parents=True, exist_ok=True)
-                    fh = open(data_dir / "tick.lock", "a+")
-                    fcntl.flock(fh, fcntl.LOCK_EX)
-            except Exception as exc:  # no fcntl (Windows) or no data dir: thread lock only
-                logger.debug("tick: process lock unavailable: %s", exc)
-                if fh is not None:
-                    fh.close()
-                    fh = None
-            try:
-                yield
-            finally:
-                if fh is not None:
-                    fh.close()  # closing releases the flock
+        files = self.files
+        with _bounded(key, files.lock_file(key) if files is not None else None):
+            yield
 
     @contextlib.contextmanager
     def update(self, session_id: str):
@@ -261,7 +368,14 @@ class Ledger:
             self.save(session_id, data)
 
     def load(self, session_id: str) -> Dict[str, Any]:
-        data = self.ctx.state.get(_key(session_id))
+        files = self.files
+        key = _key(session_id)
+        if files is None:
+            data = self.ctx.state.get(key)
+        else:
+            data = files.get(key)
+            if data is None and not self.migrated(files):
+                data = self._legacy(key)  # migration incomplete: carry the 0.2.x ledger
         base = _empty()
         if isinstance(data, dict):
             base.update(data)
@@ -278,7 +392,129 @@ class Ledger:
             items = sorted(live + (done[-room:] if room else []), key=lambda i: i["id"])[-cap:]
         data["items"] = items
         data["touched"] = _now()
-        self.ctx.state.set(_key(session_id), data)
+        files = self.files
+        if files is not None:
+            files.set(_key(session_id), data)
+        else:
+            self.ctx.state.set(_key(session_id), data)
+
+    def migrated(self, files: SessionFiles) -> bool:
+        if not self._migrated:
+            self._migrated = (files.dir / MIGRATED).exists()
+        return self._migrated
+
+    def seed_ids(self, files: SessionFiles, legacy: Dict[str, Any]) -> None:
+        """Write ``ids.json`` once, from the 0.2.x counter. Call under the ids lock.
+
+        The counter is the only durable memory of ids that gc or ``max_items``
+        already removed, so it is never rebuilt from the records that remain.
+        A malformed ``ids:next`` writes nothing: adds refuse until an operator
+        sets ``ids.json`` above every id in use.
+        """
+        old = legacy.get(ID_KEY)
+        if old is not None and not _valid_id(old):
+            logger.warning("tick: ids:next is malformed; item adds refuse until %s is set",
+                           files.root / "ids.json")
+            return
+        records = [v for k, v in legacy.items() if k.startswith(("s:", "h:"))]
+        _write_json(files.root / "ids.json", {"next": _high_water(records, old)})
+        _mark_seeded(files)
+
+    def _legacy(self, key: str) -> Optional[Dict[str, Any]]:
+        """The 0.2.x record for ``key`` from the shared store, if live; a full parse,
+        paid only for a session's first write while migration is incomplete."""
+        rec = self.ctx.state.get(key)
+        cutoff = _now() - self.cfg.session_ttl_days * 86400
+        if isinstance(rec, dict) and rec.get("touched", _now()) >= cutoff:
+            return rec
+        return None
+
+    def migrate(self) -> int:
+        """Once per profile: copy live session records out of the shared store.
+
+        Records already in ``SessionFiles`` win: a session that wrote first loaded
+        its legacy record through ``_legacy``, so it already carries it. A record
+        that fails is skipped and the marker is not written, so the next start
+        retries it. Returns the number of records copied.
+        """
+        files = self.files
+        if files is None or (files.dir / MIGRATED).exists():
+            return 0
+        with _bounded("tick:migrate", files.root / "locks" / "migrate.lock", wait=120):
+            if (files.dir / MIGRATED).exists():
+                return 0
+            legacy: Dict[str, Any] = {}
+            path = getattr(self.ctx.state, "path", None)
+            if path is not None and pathlib.Path(path).exists():
+                with open(path, encoding="utf-8-sig") as fh:
+                    legacy = json.load(fh)
+            with _bounded("tick:ids", files.root / "locks" / "ids.lock"):
+                if not _present(files.root / "ids.json") and not _present(files.root / SEED_MARK):
+                    self.seed_ids(files, legacy)  # once: a lost counter is never reseeded
+            cutoff = _now() - self.cfg.session_ttl_days * 86400
+            copied = failed = 0
+            for k, rec in legacy.items():
+                if not k.startswith(("s:", "h:")) or not isinstance(rec, dict):
+                    continue
+                if rec.get("touched", _now()) < cutoff:
+                    continue
+                try:
+                    with _bounded(k, files.lock_file(k)):
+                        if files.get(k) is None:
+                            files.set(k, rec)
+                            copied += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.warning("tick: migration kept %s in the shared store: %s", k, exc)
+            if failed == 0:
+                _write_json(files.dir / MIGRATED, {"copied": copied, "at": _now()})
+                self._migrated = True
+            return copied
+
+
+def _present(path: pathlib.Path) -> bool:
+    """Whether ``path`` exists. Only a missing file is absent; any other error raises."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _mark_seeded(files: SessionFiles) -> None:
+    """Record that ``ids.json`` was written. From then on, its absence is a loss."""
+    if not _present(files.root / SEED_MARK):
+        _write_json(files.root / SEED_MARK, {"at": _now()})
+
+
+def _valid_id(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def _read_ids(files: SessionFiles) -> "tuple[bool, Optional[int]]":
+    """(exists, next) for ``ids.json``; next is None when the file is malformed.
+    An I/O error other than a missing file raises."""
+    try:
+        text = (files.root / "ids.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False, None
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return True, None
+    nxt = doc.get("next") if isinstance(doc, dict) else None
+    return True, (nxt if _valid_id(nxt) else None)
+
+
+def _high_water(records: Any, counter: Any = None) -> int:
+    """One above every item id in ``records`` and the old counter, if valid."""
+    best = counter - 1 if _valid_id(counter) else 0
+    for rec in records:
+        if isinstance(rec, dict):
+            for item in rec.get("items") or []:
+                if isinstance(item, dict) and _valid_id(item.get("id")):
+                    best = max(best, item["id"])
+    return best + 1
 
 
 def _history_last_ts(history: Any) -> Optional[float]:
@@ -507,6 +743,7 @@ class Tick:
         self.cfg = Settings(ctx)
         self.ledger = Ledger(ctx, self.cfg)
         self._gc_at = 0.0
+        self._client_cache: Dict[str, Any] = {}
 
     # pre_llm_call ----------------------------------------------------------------
 
@@ -524,10 +761,12 @@ class Tick:
             return None
         try:
             with self.ledger.update(session_id) as data:
-                return self._turn(data, model, parent_session_id, conversation_history)
+                out = self._turn(data, model, parent_session_id, conversation_history)
         except Exception as exc:
             logger.debug("tick: state unavailable, clock only: %s", exc)
             return self._turn(_empty(), model, "", conversation_history)
+        self._gc()  # after the session lock is released, never inside it
+        return out
 
     def _turn(self, data: Dict[str, Any], model: str, parent_session_id: str,
               conversation_history: Any) -> Optional[Dict[str, str]]:
@@ -535,10 +774,10 @@ class Tick:
         now = _now()
         tz, source, home = self.client_zone(now)
         if data["last"] is None and parent_session_id and not data.get("inherited"):
-            parent = self._safe_load(parent_session_id)
-            if parent["last"] is not None or parent["items"] or parent["obs"]:
-                _inherit(data, parent)  # compaction rotated the session id: carry the ledger forward
-            data["inherited"] = True
+            data["inherited"] = True  # compaction rotated the session id: carry the ledger forward
+            data["inherit_from"] = [parent_session_id]
+        if data.get("inherit_from"):
+            self._inherit_ancestors(data)
         last = data["last"] if data["last"] is not None else _history_last_ts(conversation_history)
         gap = (now - last) if last is not None else None
         stale = gap is not None and gap >= cfg.stale_after_minutes * 60
@@ -563,16 +802,37 @@ class Tick:
 
         data["last"] = now
         data["compacted"] = False
-        self._gc()
         text = "\n".join(lines)
         return {"context": text} if text else None
 
-    def _safe_load(self, session_id: str) -> Dict[str, Any]:
-        try:
-            return self.ledger.load(session_id)
-        except Exception as exc:
-            logger.debug("tick: state unreadable: %s", exc)
-            return _empty()
+    def _inherit_ancestors(self, data: Dict[str, Any]) -> None:
+        """Merge every ledger named in ``data["inherit_from"]`` that reads now.
+
+        One that fails to read stays listed for a later turn, so the retry never
+        depends on the host passing ``parent_session_id`` again. A parent that
+        still waits on its own ancestors hands them on, so a session that
+        rotates while pending keeps its grandparent's obligations.
+        """
+        todo, left, seen = list(data["inherit_from"]), [], set()
+        while todo and len(seen) < _MAX_ANCESTORS:
+            pid = todo.pop(0)
+            if not isinstance(pid, str) or not pid or pid in seen:
+                continue
+            seen.add(pid)
+            try:
+                parent = self.ledger.load(pid)
+            except Exception as exc:  # unreadable now, not absent
+                logger.debug("tick: ledger %s unreadable, inheritance deferred: %s", pid, exc)
+                left.append(pid)
+                continue
+            if parent["last"] is not None or parent["items"] or parent["obs"]:
+                _inherit(data, parent)
+            todo.extend(parent.get("inherit_from") or [])
+        left.extend(p for p in todo if isinstance(p, str) and p and p not in seen)
+        if left:
+            data["inherit_from"] = left
+        else:
+            data.pop("inherit_from", None)
 
     # client zone ---------------------------------------------------------------------
 
@@ -585,10 +845,9 @@ class Tick:
         home = _resolve_tz(self.cfg.timezone)
         if not self.cfg.client_timezone:
             return home, "home"
-        state = self.ledger.ctx.state
         for key, kind in ((OVERRIDE_KEY, "override"), (DEVICE_KEY, "device")):
             try:
-                rec = state.get(key)
+                rec = self._client_record(key)
                 if not isinstance(rec, dict):
                     continue
                 if kind == "override":
@@ -606,6 +865,30 @@ class Tick:
             except Exception as exc:
                 logger.debug("tick: %s record unreadable: %s", kind, exc)
         return home, "home"
+
+    def _client_record(self, key: str) -> Any:
+        """``ctx.state.get(key)``, re-read only when the store file changed.
+
+        Every turn resolves the zone, and each ``get`` parses the whole store.
+        Atomic replace gives the file a new inode, so (inode, mtime, size) moves
+        on every write, including the dashboard's.
+        """
+        state = self.ledger.ctx.state
+        path = getattr(state, "path", None)
+        sig = None
+        if path is not None:
+            try:
+                st = os.stat(path)
+                sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+            except OSError:
+                sig = None
+        hit = self._client_cache.get(key)
+        if sig is not None and hit is not None and hit[0] == sig:
+            return hit[1]
+        rec = state.get(key)  # read after the stat: never older than ``sig``
+        if sig is not None:
+            self._client_cache[key] = (sig, rec)
+        return rec
 
     def client_zone(self, now: float):
         """Display view: (zone, source label, home zone to show or None)."""
@@ -652,13 +935,54 @@ class Tick:
         Called inside the session lock; the process lock file (when present)
         also serializes other processes."""
         state = self.ledger.ctx.state
-        with _ID_LOCK:
+        files = self.ledger.files
+        own = _high_water([data])
+        if files is not None:  # a small file of its own: never a rewrite of the shared store
+            with _bounded("tick:ids", files.root / "locks" / "ids.lock"):
+                exists, nxt = _read_ids(files)
+                if (not exists and not self.ledger.migrated(files)
+                        and not _present(files.root / SEED_MARK)):
+                    self.ledger.seed_ids(files, self._legacy_store())  # migration has not run yet
+                    exists, nxt = _read_ids(files)
+                if nxt is None:  # missing after its first write, or malformed
+                    raise ValueError("tick: ids.json is missing or malformed; refusing to "
+                                     "allocate an id (set next above every id in use)")
+                nxt = max(nxt, own)
+                _write_json(files.root / "ids.json", {"next": nxt + 1})
+                _mark_seeded(files)  # also covers a counter an operator wrote by hand
+                return nxt
+        with _bounded("tick:ids", None):
             nxt = state.get(ID_KEY)
-            nxt = nxt if isinstance(nxt, int) and not isinstance(nxt, bool) and nxt > 0 else 1
-            legacy = max([i.get("id", 0) for i in data.get("items", [])] + [0]) + 1
-            nxt = max(nxt, legacy)
+            if nxt is None and not state.get(SEEDED_KEY):
+                if own > 1 or self._fallback_has_ids():
+                    raise ValueError("tick: ids:next is missing from a store that holds item "
+                                     "ids; refusing to allocate an id (set ids:next above them)")
+                nxt = 1  # this store's first id: no record holds an item id
+            elif not _valid_id(nxt):
+                raise ValueError("tick: ids:next is missing or malformed; refusing to allocate an id")
+            nxt = max(nxt, own)
             state.set(ID_KEY, nxt + 1)
+            if not state.get(SEEDED_KEY):
+                state.set(SEEDED_KEY, True)
             return nxt
+
+    def _fallback_has_ids(self) -> bool:
+        """Whether a fallback store with a file already holds an item id. Records
+        written by tick before ``ids:seeded`` existed carry ids but no marker. A
+        store without a file cannot be listed (accepted risk: docs/design.md)."""
+        records = self._legacy_store()
+        return _high_water([v for k, v in records.items() if k.startswith(("s:", "h:"))]) > 1
+
+    def _legacy_store(self) -> Dict[str, Any]:
+        """The whole 0.2.x shared store, {} when absent. A read error raises."""
+        path = getattr(self.ledger.ctx.state, "path", None)
+        if path is None or not pathlib.Path(path).exists():
+            return {}
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("tick: shared store is not an object")
+        return data
 
     def command(self, raw: str = "") -> str:
         """/tz [Area/City [days] | home]"""
@@ -827,6 +1151,10 @@ class Tick:
             if _now() - self._gc_at < 6 * 3600:
                 return
             self._gc_at = _now()
+            files = self.ledger.files
+            if files is not None:
+                self._gc_files(files)
+                return
             state = self.ledger.ctx.state
             path = getattr(state, "path", None)
             if path is None:
@@ -842,11 +1170,44 @@ class Tick:
                     continue
                 if rec.get("touched", _now()) >= cutoff:
                     continue
-                cur = state.get(k)  # re-read only candidates: a turn may have touched it
-                if isinstance(cur, dict) and cur.get("touched", _now()) < cutoff:
-                    state.set(k, None)
+                try:  # re-read under the candidate's lock: a turn may have touched it
+                    with _bounded(k, None, wait=0):
+                        cur = state.get(k)
+                        if isinstance(cur, dict) and cur.get("touched", _now()) < cutoff:
+                            state.set(k, None)
+                except TimeoutError:
+                    continue  # in use now, so not idle; the next pass decides
         except Exception as exc:
             logger.debug("tick gc skipped: %s", exc)
+
+    def _gc_files(self, files: SessionFiles) -> None:
+        """Drop session files idle past the TTL: small reads, no shared rewrite.
+
+        Each candidate is re-read under its own lock, so a session touched since
+        the scan is kept. A busy lock or unreadable file is skipped, never waited
+        on or deleted, so one pass cannot add up lock waits.
+        """
+        cutoff = _now() - self.cfg.session_ttl_days * 86400
+        try:
+            entries = [e.path for e in os.scandir(files.dir) if e.name.endswith(".json")]
+        except FileNotFoundError:
+            return
+        for path in entries:
+            try:
+                doc = files.read(path)
+            except Exception as exc:
+                logger.debug("tick gc kept unreadable %s: %s", path, exc)
+                continue
+            if doc is None or doc["record"].get("touched", _now()) >= cutoff:
+                continue
+            key = doc["key"]
+            try:
+                with _bounded(key, files.lock_file(key), wait=0):
+                    cur = files.get(key)
+                    if cur is not None and cur.get("touched", _now()) < cutoff:
+                        files.delete(key)
+            except Exception as exc:
+                logger.debug("tick gc kept %s: %s", key, exc)
 
 
 TOOL_SCHEMA: Dict[str, Any] = {
@@ -881,6 +1242,11 @@ TOOL_SCHEMA: Dict[str, Any] = {
 
 def register(ctx: Any) -> None:
     plugin = Tick(ctx)
+    if plugin.cfg.enabled and plugin.cfg.ledger:
+        try:
+            plugin.ledger.migrate()
+        except Exception as exc:  # fail open: hooks read legacy records until a start succeeds
+            logger.warning("tick: session migration incomplete: %s", exc)
     ctx.register_hook("pre_llm_call", plugin.pre_llm_call)
     ctx.register_hook("post_tool_call", plugin.post_tool_call)
     ctx.register_hook("pre_auxiliary_call", plugin.pre_auxiliary_call)
