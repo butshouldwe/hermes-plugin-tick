@@ -74,13 +74,16 @@ dropped, and each session keeps at most `max_observations` (40) and
 directory to purge it.
 
 Upgrading from 0.2.x copies each live session record out of `state.json` into
-`sessions/` once, on the first start. `state.json` keeps its old copies,
-because the host state API has no delete and clearing each key would rewrite
-the whole file once per key. tick no longer reads them, and
-`session_ttl_days` does not expire them. To purge them, stop the gateway and
-remove the `s:` and `h:` keys from `state.json`. If a record fails to copy,
-the next start retries it, and until then that session's first hook reads its
-old record from `state.json`.
+`sessions/` on the first start. If a copy fails, the next start retries it.
+Until then, that session's first hook reads its old record from `state.json`.
+
+On POSIX, tick 0.3.1 compacts `state.json` once after migration. It removes
+session copies with a readable, matching session file and removes null
+tombstones outside `client:`. It keeps every client-zone key and any session
+record without a verified copy, including expired legacy records. The session
+TTL does not purge those retained legacy records. Stop old tick processes and
+back up the plugin data directory before upgrading. Returning to 0.2.x requires
+the backup because that version cannot read `sessions/`.
 
 Reconcile output is untrusted input. Recorded text is JSON-quoted and labelled
 as untrusted so it cannot forge prompt structure, but it is still sent to

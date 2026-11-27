@@ -686,9 +686,93 @@ def _rec(touched, **kw):
     return {"touched": touched, "last": kw.pop("last", touched), "obs": [], "items": [], **kw}
 
 
+def _already_migrated(monkeypatch, tmp_path):
+    monkeypatch.setattr(tick, "_now", Clock(T0))
+    ctx = FakeCtx({"timezone": "America/New_York"})
+    state = DirState(tmp_path)
+    setattr(ctx, "state", state)
+    files = tick.SessionFiles(tmp_path)
+    old = _rec(T0 - HOUR)
+    newer = _rec(T0, note="newer")
+    files.set("s:copied", newer)
+    files.set("h:copied", old)
+    files.set("s:malformed", old)
+    files.path("s:malformed").write_text("{")
+    files.set("s:wrong-key", old)
+    files.path("s:wrong-key").write_bytes(files.path("s:copied").read_bytes())
+    tick._write_json(files.dir / tick.MIGRATED, {"copied": 2, "at": T0})
+    kept = {
+        "client:override": None,
+        "client:device": {"tz": "Asia/Tokyo", "seen": T0},
+        "client:extra": {"value": None},
+        "s:missing": old,
+        "s:expired": _rec(T0 - 31 * 86400),
+        "s:malformed": old,
+        "s:wrong-key": old,
+        "ids:next": 9,
+        "other": [1, 2],
+    }
+    state.path.write_text(json.dumps({**kept, "s:copied": old, "h:copied": old,
+                                     "s:dead": None, "other:dead": None}))
+    return ctx, state, files, kept, newer
+
+
+def test_compaction_preserves_unverified_records_and_all_client_keys(monkeypatch, tmp_path):
+    ctx, state, files, kept, newer = _already_migrated(monkeypatch, tmp_path)
+    tick.register(ctx)
+    assert state._all() == kept
+    assert files.get("s:copied") == newer
+    state.set("s:after-compaction", None)
+    inode = state.path.stat().st_ino
+    tick.register(ctx)
+    assert state.path.stat().st_ino == inode
+    assert "s:after-compaction" in state._all()
+
+
+def test_compaction_interrupted_at_rename_keeps_old_bytes_and_retries(monkeypatch, tmp_path):
+    ctx, state, _, kept, _ = _already_migrated(monkeypatch, tmp_path)
+    before = state.path.read_bytes()
+    replace = os.replace
+    attempted = []
+
+    class Interrupted(BaseException):
+        pass
+
+    def interrupt(source, target):
+        if target == state.path:
+            attempted.append(json.loads(pathlib.Path(source).read_bytes()))
+            raise Interrupted()
+        return replace(source, target)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(tick.os, "replace", interrupt)
+        with pytest.raises(Interrupted):
+            tick.register(ctx)
+    assert attempted == [kept]
+    assert state.path.read_bytes() == before
+    tick.register(ctx)
+    assert state._all() == kept
+
+
+def test_compaction_waits_for_host_state_writer(monkeypatch, tmp_path):
+    import fcntl
+
+    ctx, state, _, kept, _ = _already_migrated(monkeypatch, tmp_path)
+    before = state.path.read_bytes()
+    monkeypatch.setattr(tick, "LOCK_WAIT_S", 0)
+    with open(tmp_path / ".state.json.lock", "a+b") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX)
+        tick.register(ctx)
+        assert state.path.read_bytes() == before
+        kept["client:device"] = {"tz": "Europe/Paris", "seen": T0}
+        state.set("client:device", kept["client:device"])
+    tick.register(ctx)
+    assert state._all() == kept
+
+
 def test_hooks_do_not_parse_or_rewrite_the_shared_store(monkeypatch, tmp_path):
     # 0.2.x kept every session in ctx.state, so each hook parsed and rewrote the whole
-    # file under one profile lock: 0.49 s per hook on Lyra's 6.1 MB store.
+    # file under one profile lock, even for a multi-megabyte store with thousands of sessions.
     legacy = {f"s:old{i}": _rec(T0 - HOUR) for i in range(50)}
     ctx, clock = _dir_ctx(monkeypatch, tmp_path, legacy)
     st = ctx.state
@@ -997,6 +1081,7 @@ def test_a_failed_migration_still_seeds_the_counter(monkeypatch, tmp_path):
     legacy = {
         "s:parent": _rec(T0 - HOUR, items=[{"id": 5, "kind": "open", "text": "p", "done": False, "t": T0}]),
         "ids:next": 6,
+        "s:dead": None,
     }
     real_set = tick.SessionFiles.set
 
@@ -1007,6 +1092,7 @@ def test_a_failed_migration_still_seeds_the_counter(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tick.SessionFiles, "set", refuse_parent)
     ctx, _ = _dir_ctx(monkeypatch, tmp_path, legacy)
+    assert json.loads((tmp_path / "plugin-data" / "state.json").read_bytes()) == legacy
     assert not _ledger(ctx).migrated(_ledger(ctx).files)
     assert call_tool(ctx, sid="other", action="add", kind="open", text="o")["id"] == 6
 

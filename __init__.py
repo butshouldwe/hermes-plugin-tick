@@ -220,6 +220,7 @@ SEED_MARK = "ids.seeded"  # file store: ids.json has been written once; never re
 LOCK_WAIT_S = 5.0
 _STRIPES = 64  # lock files per profile; two sessions share one only by hash collision
 MIGRATED = ".migrated-0.3"
+LEGACY_COMPACTED = ".legacy-compacted-0.3.1"
 _MAX_ANCESTORS = 16  # ledgers one turn may read while catching up on inheritance
 
 
@@ -266,7 +267,7 @@ def _bounded(name: str, lock_file: Optional[pathlib.Path], wait: Optional[float]
         lock.release()
 
 
-def _write_json(path: pathlib.Path, obj: Any) -> None:
+def _write_json(path: pathlib.Path, obj: Any, *, sync: bool = False) -> None:
     """Atomic replace, mode 0600. Same JSON dialect as the host store (NaN allowed),
     so every record 0.2.x stored can be written here."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -275,7 +276,16 @@ def _write_json(path: pathlib.Path, obj: Any) -> None:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(obj, fh, ensure_ascii=False)
+            if sync:
+                fh.flush()
+                os.fsync(fh.fileno())
         os.replace(tmp, path)
+        if sync:
+            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
@@ -470,6 +480,49 @@ class Ledger:
                 _write_json(files.dir / MIGRATED, {"copied": copied, "at": _now()})
                 self._migrated = True
             return copied
+
+    def compact_legacy(self) -> None:
+        """Remove only tombstones and session copies with a verified destination."""
+        files = self.files
+        path = getattr(self.ctx.state, "path", None)
+        # Do not rewrite on hosts where _bounded cannot share PluginState's flock.
+        if files is None or path is None or os.name != "posix":
+            return
+        marker = files.dir / LEGACY_COMPACTED
+        if _present(marker) or not _present(files.dir / MIGRATED):
+            return
+        path = pathlib.Path(path)
+        with _bounded("tick:migrate", files.root / "locks" / "migrate.lock", wait=120):
+            if _present(marker) or not _present(files.dir / MIGRATED):
+                return
+            # Dashboard and /tz writers use the host's sibling lock, not migrate.lock.
+            with _bounded(str(path), path.with_name(f".{path.name}.lock")):
+                try:
+                    with path.open(encoding="utf-8-sig") as fh:
+                        legacy = json.load(fh)
+                except FileNotFoundError:
+                    legacy = {}
+                if not isinstance(legacy, dict):
+                    raise ValueError("tick: state.json root must be an object")
+                kept = {}
+                for key, value in legacy.items():
+                    if key.startswith("client:"):
+                        kept[key] = value
+                        continue
+                    if value is None:
+                        continue
+                    if isinstance(value, dict) and key.startswith(("s:", "h:")):
+                        try:
+                            doc = files.read(files.path(key))
+                        except (OSError, ValueError):
+                            doc = None  # keep the source when the destination is unreadable
+                        if doc is not None and doc["key"] == key:
+                            continue
+                    kept[key] = value
+                if len(kept) != len(legacy):
+                    _write_json(path, kept, sync=True)
+                # A process interrupted before this write can repeat the filter safely.
+                _write_json(marker, {"at": _now()}, sync=True)
 
 
 def _present(path: pathlib.Path) -> bool:
@@ -1247,6 +1300,10 @@ def register(ctx: Any) -> None:
             plugin.ledger.migrate()
         except Exception as exc:  # fail open: hooks read legacy records until a start succeeds
             logger.warning("tick: session migration incomplete: %s", exc)
+        try:
+            plugin.ledger.compact_legacy()
+        except Exception as exc:
+            logger.warning("tick: legacy state compaction incomplete (%s)", type(exc).__name__)
     ctx.register_hook("pre_llm_call", plugin.pre_llm_call)
     ctx.register_hook("post_tool_call", plugin.post_tool_call)
     ctx.register_hook("pre_auxiliary_call", plugin.pre_auxiliary_call)
